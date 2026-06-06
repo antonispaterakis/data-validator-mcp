@@ -22,12 +22,14 @@ _CSV_FIELDS = [
     "text_preview",
     "assigned_label",
     "suggested_label",
+    "needs_review",
     "cluster_id",
     "cluster_dominant_label",
     "cluster_size",
     "llm_verdict",
     "llm_confidence",
     "llm_reasoning",
+    "detection_source",
 ]
 
 

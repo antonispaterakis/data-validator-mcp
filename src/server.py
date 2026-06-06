@@ -2,9 +2,9 @@
 MCP server for data-validator-mcp.
 
 Exposes four tools:
-  • validate_dataset      — run the full pipeline on a CSV
-  • get_flagged_rows      — retrieve rows the pipeline flagged as mislabeled
-  • get_cluster_overview  — inspect the discovered clusters
+  • validate_dataset      — run the full KNN pipeline on a CSV
+  • get_flagged_rows      — retrieve rows the pipeline confirmed as mislabeled
+  • get_knn_stats         — inspect per-row KNN agreement scores for suspicious rows
   • export_report         — write flagged CSV + full JSON report to disk
 
 State is held in a module-level object so results persist across tool calls
@@ -26,15 +26,15 @@ mcp = FastMCP(
     "data-validator-mcp",
     instructions=(
         "Training data label quality validator — detects mislabeled rows in a CSV "
-        "using semantic clustering + a local LLM judge (Ollama). No API key needed.\n\n"
+        "using KNN agreement scoring + a local LLM judge (LM Studio). No API key needed.\n\n"
         "Step 1 — Call validate_dataset with the path to your CSV, the name of the "
-        "text column, and the name of the label column. Optionally tune max_clusters "
-        "and purity_threshold.\n\n"
+        "text column, and the name of the label column. Optionally tune k_neighbors "
+        "and agreement_threshold.\n\n"
         "Step 2 — Call get_flagged_rows to see every suspicious row: what label it "
-        "has, what the cluster suggests, the LLM verdict (good/bad), confidence, "
+        "has, neighbour agreement score, LLM verdict (good/bad), confidence, "
         "reasoning, and a suggested correction where the model is confident.\n\n"
-        "Step 3 — Call get_cluster_overview to inspect how the data was partitioned "
-        "and check cluster purity across all discovered groups.\n\n"
+        "Step 3 — Call get_knn_stats to inspect the KNN agreement distribution "
+        "across all rows flagged as suspicious before the LLM pass.\n\n"
         "Step 4 — Call export_report with an output directory to save a "
         "flagged_rows CSV and a full JSON report to disk for sharing or review."
     ),
@@ -56,81 +56,56 @@ def validate_dataset(
     csv_path: Annotated[str, Field(description="Absolute path to the CSV file to validate.")],
     text_col: Annotated[str, Field(description="Name of the column containing the text samples.")],
     label_col: Annotated[str, Field(description="Name of the column containing the assigned labels.")],
-    max_clusters: Annotated[
+    k_neighbors: Annotated[
         int,
         Field(
-            ge=1,
-            le=50,
+            ge=3,
+            le=100,
             description=(
-                "Upper bound on the number of clusters HiPart may create. "
-                "Lower values produce coarser, more reliable groupings. "
-                "Default of 12 works well for datasets up to ~500 rows."
+                "Number of nearest neighbours to consider per row. "
+                "Higher K = more stable agreement scores but slower. "
+                "Default of 15 works well for datasets up to ~1000 rows."
             ),
         ),
-    ] = 12,
-    purity_threshold: Annotated[
+    ] = 5,
+    agreement_threshold: Annotated[
         float,
         Field(
             ge=0.0,
             le=1.0,
             description=(
-                "Minimum fraction of one label in a cluster before its outliers are flagged. "
-                "Raise (e.g. 0.80) to reduce false positives; lower (e.g. 0.50) to catch more "
-                "potential errors at the cost of more noise."
+                "Fraction of neighbours that must share a row's label for it to be "
+                "considered clean. Rows below this threshold are sent to the LLM. "
+                "Lower values (e.g. 0.3) flag fewer rows; higher (e.g. 0.7) flags more."
             ),
         ),
-    ] = 0.60,
-    use_umap: Annotated[
-        bool,
-        Field(
-            description=(
-                "Apply UMAP dimensionality reduction before clustering. "
-                "Helps on small or semantically dense datasets where HiPart struggles "
-                "to find clean separations in raw embedding space. Adds ~2-5s."
-            ),
-        ),
-    ] = False,
+    ] = 0.5,
     llm_model: Annotated[
         str,
         Field(
-            description=(
-                "Ollama model used for judging. Larger models give better precision. "
-                "llama3.1:8b is recommended. llama3.2 is faster but less accurate."
-            ),
+            description="LM Studio model name to use for judging. Must match the model loaded in LM Studio.",
         ),
-    ] = "llama3.1:8b",
-    blob_pass: Annotated[
-        bool,
-        Field(
-            description=(
-                "Run a second LLM pass on rows in low-purity (mixed) clusters. "
-                "Improves recall by covering rows that clustering alone cannot judge. "
-                "Increases LLM calls proportional to blob cluster size, but stays "
-                "well below a full dataset pass."
-            ),
-        ),
-    ] = True,
+    ] = "meta-llama-3.1-8b-instruct",
 ) -> dict:
     """
-    Run the full validation pipeline on a CSV file and return a summary report.
+    Run the full KNN validation pipeline on a CSV file and return a summary report.
 
     Pipeline stages (all timed):
       1. Encode each text row into a semantic embedding vector
-      2. Cluster embeddings with HiPart dePDDP
-      3. Flag rows whose label disagrees with their cluster's dominant label
-         (only in clusters above purity_threshold — mixed clusters are skipped)
-      4. Send each flagged row to a local Ollama LLM for verdict confirmation
+      2. Select one anchor (most representative example) per label
+      3. Compute full pairwise cosine similarity matrix
+      4. For each row, find K nearest neighbours and compute label agreement
+      5. Flag rows with agreement below threshold as suspicious
+      6. Send each suspicious row to the LLM with anchor + neighbour context
 
-    Returns a summary dict with total rows, cluster count, flag count,
-    LLM verdict breakdown, estimated mislabel %, and per-stage timing.
+    Returns a summary dict with total rows, suspicious count, LLM verdict
+    breakdown, estimated mislabel %, token_stats, and per-stage timing.
     """
     global _pipeline, _ran
     try:
         _pipeline = ValidationPipeline(
-            max_clusters=max_clusters,
-            purity_threshold=purity_threshold,
-            use_umap=use_umap,
-            blob_pass=blob_pass,
+            k_neighbors=k_neighbors,
+            agreement_threshold=agreement_threshold,
             llm_model=llm_model,
         )
         summary = _pipeline.run(csv_path, text_col, label_col)
@@ -146,20 +121,23 @@ def validate_dataset(
 )
 def get_flagged_rows() -> list | dict:
     """
-    Return all rows flagged as potentially mislabeled.
+    Return all rows confirmed as potentially mislabeled by the LLM.
 
     Each entry includes:
-      - row_index          original row number in the CSV
-      - text_preview       first 200 characters of the text
-      - assigned_label     the label currently in the dataset
-      - suggested_label    recommended correction (set when verdict=bad and confidence=high,
-                           null otherwise — human review required for uncertain cases)
-      - cluster_id         which cluster this row belongs to
-      - cluster_dominant_label  the most common label in that cluster
-      - cluster_size       number of rows in the cluster
-      - llm_verdict        "good" (label is correct), "bad" (mislabeled), or "unknown"
-      - llm_confidence     "high", "medium", or "low"
-      - llm_reasoning      one or two sentence explanation from the LLM
+      - row_index              original row number in the CSV
+      - text_preview           first 200 characters of the text
+      - assigned_label         the label currently in the dataset
+      - suggested_label        recommended correction (set when verdict=bad and
+                               confidence=high; null otherwise)
+      - needs_review           True when verdict=bad but confidence is medium —
+                               human review advised before applying the correction
+      - neighbor_agreement     fraction of K nearest neighbours sharing this label
+      - n_matching_neighbors   count of neighbours with the same label
+      - k_neighbors            K used in the KNN pass
+      - llm_verdict            "good" (label is correct) or "bad" (mislabeled)
+      - llm_confidence         "high" or "medium" (low-confidence bad are discarded)
+      - llm_reasoning          one or two sentence explanation from the LLM
+      - detection_source       always "knn"
 
     Must call validate_dataset first.
     """
@@ -169,27 +147,31 @@ def get_flagged_rows() -> list | dict:
 
 
 @mcp.tool(
-    title="Get Cluster Overview",
+    title="Get KNN Stats",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
-def get_cluster_overview() -> list | dict:
+def get_knn_stats() -> list | dict:
     """
-    Return a summary of every cluster discovered during validation.
+    Return KNN agreement statistics for every row flagged as suspicious
+    before the LLM pass (i.e. all rows with agreement < threshold).
 
     Each entry includes:
-      - cluster_id           integer cluster identifier
-      - size                 number of rows assigned to this cluster
-      - dominant_label       the most frequent label in the cluster
-      - label_distribution   full count of every label present in the cluster
+      - row_index              original row number in the CSV
+      - text_preview           first 200 characters of the text
+      - assigned_label         the label currently in the dataset
+      - neighbor_agreement     fraction of K neighbours sharing this label
+      - n_matching_neighbors   count of neighbours with the same label
+      - k                      K used
+      - neighbor_label_counts  full label distribution among the K neighbours
 
-    High-purity clusters (one label dominates) are reliable signal.
-    Low-purity clusters are semantically mixed — flagging is skipped for these.
+    Useful for understanding the difficulty of each flagged row before
+    looking at the LLM verdicts.
 
     Must call validate_dataset first.
     """
     if not _ran:
         return {"error": "No dataset has been validated yet. Call validate_dataset first."}
-    return _pipeline.cluster_info
+    return _pipeline.knn_stats
 
 
 @mcp.tool(
@@ -208,7 +190,7 @@ def export_report(
                 "if it does not exist. Two timestamped files are generated: "
                 "flagged_rows_<timestamp>.csv (human-friendly, opens in Excel) and "
                 "report_<timestamp>.json (full machine-readable dump with summary, "
-                "flagged rows, and cluster overview)."
+                "flagged rows, and KNN stats)."
             )
         ),
     ],
@@ -228,7 +210,7 @@ def export_report(
         paths = writer.write(
             summary=_pipeline.summary,
             flagged_rows=_pipeline.flagged_rows,
-            cluster_info=_pipeline.cluster_info,
+            cluster_info=_pipeline.knn_stats,
         )
         return {"status": "ok", "files": paths}
     except Exception as exc:

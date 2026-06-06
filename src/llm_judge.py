@@ -1,16 +1,21 @@
 """
-LLM-as-judge: uses a local Ollama model to confirm whether a flagged row is truly mislabeled.
+LLM-as-judge: uses a local LM Studio model to confirm whether a flagged row is truly mislabeled.
 
-Communicates with Ollama via its OpenAI-compatible API (http://localhost:11434/v1).
+Communicates with LM Studio via its OpenAI-compatible API (http://localhost:1234/v1).
 No API key or internet connection required — all inference runs locally.
 
 Two judge modes:
-  judge_row()      — used for clustering-flagged rows. Has strong cluster context
-                     (dominant label + example texts). High signal.
-  judge_blob_row() — used for rows in low-purity "blob" clusters where no dominant
-                     label exists. Relies on the full label taxonomy + cluster
-                     distribution instead. Also asks the LLM to suggest the correct
-                     label directly, since cluster dominant is unreliable here.
+  judge_row()      — Pass 1: clustering-flagged rows. Strong context: anchor example
+                     for the dominant label + cluster peer texts.
+  judge_blob_row() — Pass 2: rows in low-purity blob clusters. Uses K=3 nearest
+                     neighbors from pure clusters (relative context) + per-label
+                     anchors (absolute context). Also asks the LLM to suggest the
+                     correct label directly.
+
+Token tracking:
+  Both modes accumulate input + output token counts from the response
+  (via response.usage.prompt_tokens / completion_tokens). Access via
+  judge.token_stats after the run.
 
 Key efficiency insight from Theocharopoulos et al. (2025): the LLM is only
 invoked on the subset of rows that the clustering step flagged as suspicious —
@@ -28,8 +33,12 @@ _JUDGE_PROMPT = """\
 You are a data quality expert reviewing a machine learning training dataset.
 
 A text sample has been flagged as potentially mislabeled. It was grouped by \
-semantic similarity with other texts whose dominant label is different from \
-the label assigned to it.
+semantic similarity with other texts whose dominant label differs from its \
+assigned label.
+
+--- ANCHOR (verified representative example for label "{cluster_label}") ---
+{anchor_text}
+--- END ANCHOR ---
 
 --- FLAGGED SAMPLE ---
 Text: {text}
@@ -41,7 +50,8 @@ Other texts in the same cluster (for reference):
 {cluster_examples}
 --- END CONTEXT ---
 
-Decide whether the assigned label "{label}" is CORRECT for this text.
+Compare the flagged sample against the anchor example above. Decide whether \
+the assigned label "{label}" is CORRECT for this text.
 
 Reply ONLY with valid JSON in exactly this format — no extra keys, no markdown:
 {{
@@ -57,9 +67,16 @@ Reply ONLY with valid JSON in exactly this format — no extra keys, no markdown
 _BLOB_JUDGE_PROMPT = """\
 You are a data quality expert reviewing a machine learning training dataset.
 
-This text sample belongs to a semantically mixed cluster — labels are distributed \
-across multiple categories with no clear dominant label. Automatic detection could \
-not determine if this sample is correctly labeled, so your judgment is required.
+This text sample belongs to a semantically mixed cluster — no dominant label \
+could be determined automatically. Your judgment is required.
+
+--- NEAREST NEIGHBOR CONTEXT (confirmed examples from high-purity clusters) ---
+{neighbor_texts}
+--- END NEIGHBORS ---
+
+--- ANCHOR EXAMPLES (verified representative example per candidate label) ---
+{anchor_texts}
+--- END ANCHORS ---
 
 --- SAMPLE ---
 Text: {text}
@@ -70,10 +87,50 @@ All valid labels in this dataset: {all_labels}
 Label distribution in this sample's cluster: {cluster_distribution}
 --- END CONTEXT ---
 
-Decide whether the assigned label "{label}" is CORRECT for this text.
-If it is wrong, also provide the correct label from the valid labels list.
+Compare the sample against the neighbor context and anchor examples above. \
+Decide whether the assigned label "{label}" is CORRECT for this text. \
+If it is wrong, provide the correct label from the valid labels list.
 
 Reply ONLY with valid JSON in exactly this format — no extra keys, no markdown:
+{{
+  "verdict": "good",
+  "confidence": "high",
+  "reasoning": "one or two sentences",
+  "suggested_label": null
+}}
+
+"verdict" must be "good" (label is correct) or "bad" (label is wrong).
+"confidence" must be "high", "medium", or "low".
+"suggested_label" must be one of the valid labels if verdict is "bad", otherwise null.\
+"""
+
+
+_KNN_JUDGE_PROMPT = """\
+You are a data quality expert reviewing a machine learning training dataset.
+
+A text sample is flagged as potentially mislabeled: only {n_matching} of its {k} \
+nearest semantic neighbours share its assigned label ({agreement:.0%} agreement).
+
+--- ANCHOR (verified representative example for label "{label}") ---
+{anchor_text}
+--- END ANCHOR ---
+
+--- NEAREST NEIGHBOURS (top 5 most semantically similar texts and their labels) ---
+{neighbor_texts}
+--- END NEIGHBOURS ---
+
+--- FLAGGED SAMPLE ---
+Text: {text}
+Assigned label: "{label}"
+--- END SAMPLE ---
+
+All valid labels in this dataset: {all_labels}
+
+Compare the sample against the anchor and neighbours. Does the assigned label \
+"{label}" seem correct for this text? If not, which label from the valid labels \
+list fits better?
+
+Reply ONLY with valid JSON, no markdown:
 {{
   "verdict": "good",
   "confidence": "high",
@@ -90,12 +147,22 @@ Reply ONLY with valid JSON in exactly this format — no extra keys, no markdown
 class LLMJudge:
     """Thin wrapper around the Ollama OpenAI-compatible API for single-row label judgement."""
 
-    def __init__(self, model: str = "llama3.2"):
+    def __init__(self, model: str = "meta-llama-3.1-8b-instruct"):
         self.client = OpenAI(
-            base_url="http://localhost:11434/v1",
-            api_key="ollama",  # Required by the SDK, ignored by Ollama
+            base_url="http://localhost:1234/v1",
+            api_key="lm-studio",  # Required by the SDK, ignored by LM Studio
         )
         self.model = model
+        self._total_input_tokens: int = 0
+        self._total_output_tokens: int = 0
+
+    @property
+    def token_stats(self) -> dict:
+        return {
+            "total_input_tokens": self._total_input_tokens,
+            "total_output_tokens": self._total_output_tokens,
+            "total_tokens": self._total_input_tokens + self._total_output_tokens,
+        }
 
     def judge_row(
         self,
@@ -103,10 +170,11 @@ class LLMJudge:
         label: str,
         cluster_dominant: str,
         cluster_examples: list[str],
+        anchor_text: str = "",
     ) -> dict:
         """
-        First-pass judge: called for rows flagged by clustering.
-        Has strong cluster context — dominant label + example texts.
+        Pass 1 judge: called for rows flagged by clustering.
+        Context: anchor example for the dominant label + cluster peer texts.
 
         Returns: verdict, confidence, reasoning.
         """
@@ -118,6 +186,7 @@ class LLMJudge:
             text=text[:600],
             label=label,
             cluster_label=cluster_dominant,
+            anchor_text=anchor_text[:300] if anchor_text else "(not available)",
             cluster_examples=examples_str,
         )
         return self._call(prompt, expect_suggested_label=False)
@@ -128,21 +197,78 @@ class LLMJudge:
         label: str,
         all_labels: list[str],
         cluster_distribution: dict[str, int],
+        neighbor_contexts: list[dict] | None = None,
+        anchor_texts: dict[str, str] | None = None,
     ) -> dict:
         """
-        Second-pass judge: called for rows in low-purity blob clusters.
-        No dominant label to reference — uses full taxonomy + cluster distribution.
+        Pass 2 judge: called for rows in low-purity blob clusters.
+        Context: K=3 nearest neighbors from pure clusters + per-label anchors.
 
         Returns: verdict, confidence, reasoning, suggested_label.
         """
         dist_str = ", ".join(f"{lbl}×{cnt}" for lbl, cnt in sorted(
             cluster_distribution.items(), key=lambda x: -x[1]
         ))
+
+        # Format neighbor context
+        if neighbor_contexts:
+            neighbor_lines = "\n".join(
+                f'  [{nc["label"]}] {nc["text"][:150]}'
+                for nc in neighbor_contexts
+            )
+        else:
+            neighbor_lines = "  (no neighbor context available)"
+
+        # Format anchor texts — only show anchors for candidate labels in this cluster
+        candidate_labels = list(cluster_distribution.keys()) or all_labels
+        if anchor_texts:
+            anchor_lines = "\n".join(
+                f'  [{lbl}]: {anchor_texts[lbl][:200]}'
+                for lbl in candidate_labels
+                if lbl in anchor_texts
+            ) or "  (not available)"
+        else:
+            anchor_lines = "  (not available)"
+
         prompt = _BLOB_JUDGE_PROMPT.format(
             text=text[:600],
             label=label,
             all_labels=", ".join(f'"{l}"' for l in all_labels),
             cluster_distribution=dist_str,
+            neighbor_texts=neighbor_lines,
+            anchor_texts=anchor_lines,
+        )
+        return self._call(prompt, expect_suggested_label=True)
+
+    def judge_knn_row(
+        self,
+        text: str,
+        label: str,
+        anchor_text: str,
+        neighbor_contexts: list[dict],
+        agreement: float,
+        n_matching: int,
+        k: int,
+        all_labels: list[str],
+    ) -> dict:
+        """
+        Unified KNN judge: context = anchor for assigned label + K nearest neighbours.
+        Returns: verdict, confidence, reasoning, suggested_label.
+        """
+        neighbor_lines = "\n".join(
+            f'  [{nc["label"]}] {nc["text"][:150]}'
+            for nc in neighbor_contexts[:5]
+        ) or "  (no neighbour context available)"
+
+        prompt = _KNN_JUDGE_PROMPT.format(
+            text=text[:600],
+            label=label,
+            anchor_text=anchor_text[:300] if anchor_text else "(not available)",
+            neighbor_texts=neighbor_lines,
+            agreement=agreement,
+            n_matching=n_matching,
+            k=k,
+            all_labels=", ".join(f'"{l}"' for l in all_labels),
         )
         return self._call(prompt, expect_suggested_label=True)
 
@@ -154,9 +280,15 @@ class LLMJudge:
         response = self.client.chat.completions.create(
             model=self.model,
             max_tokens=400,
+            temperature=0,
             messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
         )
+
+        # Accumulate token counts from LM Studio response
+        if response.usage:
+            self._total_input_tokens += response.usage.prompt_tokens or 0
+            self._total_output_tokens += response.usage.completion_tokens or 0
+
         raw = response.choices[0].message.content.strip()
 
         # Strip markdown code fences if the model adds them despite instructions
