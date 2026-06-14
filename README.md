@@ -6,27 +6,27 @@ An MCP (Model Context Protocol) server that validates the label quality of tabul
 
 ## Methodology
 
-The validation approach is directly derived from:
+This project's lineage traces back to:
 
 > **Theocharopoulos, A., Anagnostou, A., Georgakopoulos, S., Tasoulis, S., & Plagianakos, V.**
 > *Large Language Models for Efficient Topic Modeling.*
 > **Neural Computing and Applications**, 2025.
 
-The paper proposes a three-stage pipeline for topic discovery in text corpora:
+The paper's core insight — encode documents into embeddings, use a cheap unsupervised signal to decide which rows are worth examining, and call an LLM only on that minority — carries over directly to label validation:
 
-1. **Sentence-BERT embeddings** — encode documents into dense semantic vectors.
-2. **HiPart hierarchical divisive clustering** — partition the embedding space recursively using the `dePDDP` algorithm, which applies PCA-based principal direction splitting.
-3. **LLM labeling** — use an LLM to name the discovered clusters, but crucially only on cluster representatives — not on the whole corpus.
-
-**This project adapts that pipeline for label validation instead of topic discovery:**
+1. **Embeddings** — encode each row's text into a dense semantic vector.
+2. **KNN agreement scoring** — for each row, find its K nearest neighbours by embedding similarity and compute what fraction of them share its assigned label. Rows whose neighbours mostly *disagree* with the label are flagged as suspicious.
+3. **LLM judge** — only the suspicious rows go to an LLM (via Ollama), which returns a verdict (`good`/`bad`), confidence, reasoning, and — when confident — a suggested correction.
 
 | Original (topic modeling) | This project (label validation) |
 |---|---|
-| Cluster unlabeled documents | Cluster already-labeled documents |
+| Cluster unlabeled documents | Score each labeled row against its embedding neighbours |
 | LLM names each cluster | LLM judges suspicious rows only |
 | Goal: discover topics | Goal: detect annotation errors |
 
-The key efficiency insight — inherited from the paper — is that **the LLM is only called on the minority of rows that the clustering step flags as suspicious** (those whose assigned label disagrees with their cluster's dominant label). This keeps API cost proportional to the noise level in the data rather than to its total size.
+The key efficiency insight — inherited from the paper — is that **the LLM is only called on the minority of rows the KNN step flags as suspicious** (those whose label disagrees with most of their nearest neighbours). This keeps inference cost proportional to the noise level in the data rather than to its total size — on the bundled sample dataset that's 32 LLM calls instead of 60 (see `llm_calls_saved_vs_full_pass` in the report).
+
+> Earlier versions of this pipeline used HiPart hierarchical clustering (`dePDDP`) to group rows before flagging outliers — `src/clustering.py` still contains that code but is no longer used by `ValidationPipeline`. Per-row KNN agreement scoring replaced it: simpler, no cluster count to tune, and rows are flagged individually rather than relative to a cluster's dominant label.
 
 ---
 
@@ -35,15 +35,16 @@ The key efficiency insight — inherited from the paper — is that **the LLM is
 ```
 data-validator-mcp/
 ├── src/
-│   ├── embeddings.py     # Sentence-BERT encoding (all-MiniLM-L6-v2)
-│   ├── clustering.py     # HiPart dePDDP clustering + cluster stats
+│   ├── embeddings.py     # Sentence-BERT / domain encoder
+│   ├── clustering.py     # legacy HiPart dePDDP clustering — no longer used
 │   ├── llm_judge.py      # Ollama LLM-as-judge for flagged rows
-│   ├── pipeline.py       # Full orchestration
-│   └── server.py         # MCP server (FastMCP, 3 tools)
+│   ├── pipeline.py       # Full orchestration (embeddings → KNN agreement → LLM judge)
+│   ├── report.py         # CSV + JSON report export
+│   └── server.py         # MCP server (FastMCP, 4 tools)
 ├── tests/
 │   └── test_pipeline.py
 ├── data/
-│   └── sample_dataset.csv   # 60 rows, ~10 intentionally mislabeled
+│   └── sample_dataset.csv   # 60 rows, ~20 intentionally mislabeled
 ├── requirements.txt
 └── .env.example
 ```
@@ -61,7 +62,7 @@ pip install -r requirements.txt
 Ensure [Ollama](https://ollama.com) is installed and running, then pull the judge model:
 
 ```bash
-ollama pull llama3.2
+ollama pull llama3.1:8b
 ```
 
 ---
@@ -98,27 +99,33 @@ No API key needed — the server uses a local Ollama instance. Make sure Ollama 
 
 ## MCP Tools
 
-### `validate_dataset(csv_path, text_col, label_col)`
+### `validate_dataset(csv_path, text_col, label_col, k_neighbors=5, agreement_threshold=0.5, llm_model="llama3.1:8b")`
 
 Runs the full pipeline and returns a JSON summary report.
 
 ```json
 {
   "total_rows": 60,
-  "n_clusters": 7,
-  "n_flagged": 12,
-  "flagged_pct": 20.0,
-  "llm_bad": 9,
-  "llm_good": 3,
+  "k_neighbors": 5,
+  "agreement_threshold": 0.5,
+  "n_suspicious": 32,
+  "n_confirmed_bad": 32,
+  "llm_bad": 32,
+  "llm_good": 0,
   "llm_unknown": 0,
-  "estimated_mislabel_pct": 15.0,
-  "label_counts": {"technology": 14, "sports": 13, ...}
+  "estimated_mislabel_pct": 53.3,
+  "label_counts": {"technology": 14, "sports": 13, "...": "..."},
+  "llm_calls_made": 32,
+  "llm_calls_saved_vs_full_pass": 28,
+  "llm_model": "llama3.1:8b",
+  "token_stats": {"tokens_used": 0, "rows_scanned_by_llm": 32, "total_rows": 60, "efficiency_ratio": 1.9},
+  "timing_seconds": {"encode": 0.0, "knn": 0.0, "judge": 0.0, "total": 0.0}
 }
 ```
 
 ### `get_flagged_rows()`
 
-Returns the full list of rows flagged as potentially mislabeled, each with the LLM verdict and reasoning. Must call `validate_dataset` first.
+Returns every row the LLM confirmed as potentially mislabeled. Must call `validate_dataset` first.
 
 ```json
 [
@@ -126,30 +133,42 @@ Returns the full list of rows flagged as potentially mislabeled, each with the L
     "row_index": 40,
     "text_preview": "Barcelona beats Real Madrid 3-0 in El Clasico...",
     "assigned_label": "technology",
-    "cluster_id": 2,
-    "cluster_dominant_label": "sports",
-    "cluster_size": 11,
+    "suggested_label": "sports",
+    "needs_review": false,
+    "neighbor_agreement": 0.2,
+    "n_matching_neighbors": 1,
+    "k_neighbors": 5,
     "llm_verdict": "bad",
     "llm_confidence": "high",
-    "llm_reasoning": "This text is clearly about a football match and belongs to sports, not technology."
+    "llm_reasoning": "This text is clearly about a football match and belongs to sports, not technology.",
+    "detection_source": "knn"
   }
 ]
 ```
 
-### `get_cluster_overview()`
+`suggested_label` is set when `llm_verdict="bad"` and `llm_confidence="high"`. `needs_review=true` marks `bad`/medium-confidence rows for a human to check before applying any correction.
 
-Shows every cluster with its size, dominant label, and full label distribution. Must call `validate_dataset` first.
+### `get_knn_stats()`
+
+Returns KNN agreement statistics for every row flagged as suspicious *before* the LLM pass — useful for seeing how borderline each flagged row was. Must call `validate_dataset` first.
 
 ```json
 [
   {
-    "cluster_id": 0,
-    "size": 9,
-    "dominant_label": "politics",
-    "label_distribution": {"politics": 7, "sports": 1, "entertainment": 1}
+    "row_index": 40,
+    "text_preview": "Barcelona beats Real Madrid 3-0 in El Clasico...",
+    "assigned_label": "technology",
+    "neighbor_agreement": 0.2,
+    "n_matching_neighbors": 1,
+    "k": 5,
+    "neighbor_label_counts": {"sports": 4, "technology": 1}
   }
 ]
 ```
+
+### `export_report(output_dir)`
+
+Writes `flagged_rows_<timestamp>.csv` (human-friendly) and `report_<timestamp>.json` (full machine-readable dump: summary + flagged rows + KNN stats) to `output_dir`. Must call `validate_dataset` first.
 
 ---
 
@@ -170,20 +189,21 @@ Tests cover: embedding shape/dtype/normalization, cluster dominant-label logic, 
 
 Approximately **20 rows are intentionally mislabeled** (rows 41–60) — e.g. a sports headline labeled `technology`, a medical headline labeled `sports` — to demonstrate the validator's detection capability.
 
+**Verified run** (default settings — `k_neighbors=5`, `agreement_threshold=0.5`, `llm_model=llama3.1:8b`): 32/60 rows flagged as suspicious by KNN, all 32 confirmed `bad` by the LLM judge (`estimated_mislabel_pct: 53.3`). That's higher than the ~20 rows documented as intentionally mislabeled — at this threshold the KNN step also catches genuinely ambiguous boundary-case rows that the LLM agrees are mislabeled. Lowering `agreement_threshold` trades recall for precision if a tighter match to the known-bad rows is needed.
+
 ---
 
 ## Configuration
 
-The `ValidationPipeline` constructor exposes these parameters (all have sensible defaults):
+`validate_dataset` exposes these parameters (all have sensible defaults):
 
 | Parameter | Default | Description |
 |---|---|---|
-| `embedding_model` | `all-MiniLM-L6-v2` | Sentence-BERT model name |
-| `max_clusters` | `12` | Upper bound on clusters for HiPart |
-| `min_sample_split` | `3` | Minimum rows to split a cluster further |
-| `purity_threshold` | `0.60` | Min fraction of dominant label in a cluster before its outliers are flagged |
-| `llm_model` | `llama3.1:8b` | Ollama model used for judging |
-| `blob_pass` | `True` | Second LLM pass on mixed-cluster rows for higher recall |
+| `k_neighbors` | `5` | Number of nearest neighbours per row for agreement scoring |
+| `agreement_threshold` | `0.5` | Minimum fraction of neighbours that must share a row's label for it to be considered clean |
+| `llm_model` | `llama3.1:8b` | Ollama model used for judging flagged rows |
+
+`ValidationPipeline`'s constructor also exposes `embedding_model` (default: `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract`, reflecting this project's clinical-data validation use case — swap for `all-MiniLM-L6-v2` for general-purpose text).
 
 ---
 
