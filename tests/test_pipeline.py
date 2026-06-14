@@ -102,42 +102,52 @@ class TestValidationPipeline:
         with pytest.raises(ValueError, match="Column\\(s\\) not found"):
             pipe._load_csv(self.DATA_PATH, "nonexistent", "label")
 
-    def test_detect_conflicts_returns_list(self, monkeypatch):
-        """Detect conflicts without running full pipeline — inject synthetic state."""
-        pipe = ValidationPipeline()
+    def _one_hot_embeddings(self, labels: pd.Series) -> np.ndarray:
+        """Embeddings where every row is a one-hot vector for its label —
+        guarantees each row's nearest neighbours all share its label."""
+        unique_labels = labels.unique().tolist()
+        label_to_idx = {lbl: i for i, lbl in enumerate(unique_labels)}
+        emb = np.zeros((len(labels), len(unique_labels)))
+        for i, lbl in enumerate(labels):
+            emb[i, label_to_idx[lbl]] = 1.0
+        return emb
+
+    def test_compute_knn_flags_returns_expected_structure(self):
+        """When every row's neighbours all share its label, nothing is flagged."""
+        pipe = ValidationPipeline(k_neighbors=5, agreement_threshold=0.5)
         pipe.df = pd.read_csv(self.DATA_PATH)
         pipe.df = pipe.df.dropna(subset=["text", "label"]).reset_index(drop=True)
-        n = len(pipe.df)
+        texts = pipe.df["text"].tolist()
+        labels = pipe.df["label"]
 
-        # Synthetic: all rows in cluster 0, so no conflicts expected
-        pipe.cluster_assignments = np.zeros(n, dtype=int)
-        conflicts = pipe._detect_conflicts(pipe.df["label"])
-        assert isinstance(conflicts, list)
+        pipe.embeddings = self._one_hot_embeddings(labels)
+        suspicious, knn_stats, neighbor_lookup = pipe._compute_knn_flags(texts, labels)
+
+        assert suspicious == []
+        assert knn_stats == []
+        assert isinstance(neighbor_lookup, dict)
 
     def test_run_skips_llm_when_no_conflicts(self, monkeypatch):
         """
-        If cluster assignments perfectly match labels, no LLM calls should happen
-        and the summary should report 0 flagged rows.
+        If every row's nearest neighbours all share its label, no row is
+        suspicious, so no LLM calls should happen and the summary should
+        report 0 flagged rows.
         """
         import src.pipeline as pl
 
-        # Intercept encode_texts to return cheap random vectors
+        df = pd.read_csv(self.DATA_PATH).dropna(subset=["text", "label"]).reset_index(drop=True)
+        embeddings = self._one_hot_embeddings(df["label"])
+
+        # Intercept encode_texts to return one-hot-per-label embeddings
         monkeypatch.setattr(
             pl,
             "encode_texts",
-            lambda texts, **kwargs: np.random.randn(len(texts), 16),
+            lambda texts, **kwargs: embeddings,
         )
 
-        # Intercept cluster_embeddings to put every row in cluster 0
-        monkeypatch.setattr(
-            pl,
-            "cluster_embeddings",
-            lambda embeddings, **kwargs: np.zeros(len(embeddings), dtype=int),
-        )
-
-        pipe = ValidationPipeline()
+        pipe = ValidationPipeline(k_neighbors=5)
         summary = pipe.run(self.DATA_PATH, "text", "label")
 
-        assert summary["n_flagged"] == 0
+        assert summary["n_suspicious"] == 0
         assert summary["llm_bad"] == 0
         assert summary["total_rows"] > 0

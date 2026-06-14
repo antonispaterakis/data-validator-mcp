@@ -1,7 +1,7 @@
 """
-LLM-as-judge: uses a local LM Studio model to confirm whether a flagged row is truly mislabeled.
+LLM-as-judge: uses a local Ollama model to confirm whether a flagged row is truly mislabeled.
 
-Communicates with LM Studio via its OpenAI-compatible API (http://localhost:1234/v1).
+Communicates with Ollama via its OpenAI-compatible API (http://localhost:11434/v1).
 No API key or internet connection required — all inference runs locally.
 
 Two judge modes:
@@ -147,10 +147,10 @@ Reply ONLY with valid JSON, no markdown:
 class LLMJudge:
     """Thin wrapper around the Ollama OpenAI-compatible API for single-row label judgement."""
 
-    def __init__(self, model: str = "meta-llama-3.1-8b-instruct"):
+    def __init__(self, model: str = "llama3.1:8b"):
         self.client = OpenAI(
-            base_url="http://localhost:1234/v1",
-            api_key="lm-studio",  # Required by the SDK, ignored by LM Studio
+            base_url="http://localhost:11434/v1",
+            api_key="ollama",  # Required by the SDK, ignored by Ollama
         )
         self.model = model
         self._total_input_tokens: int = 0
@@ -284,7 +284,7 @@ class LLMJudge:
             messages=[{"role": "user", "content": prompt}],
         )
 
-        # Accumulate token counts from LM Studio response
+        # Accumulate token counts from Ollama response
         if response.usage:
             self._total_input_tokens += response.usage.prompt_tokens or 0
             self._total_output_tokens += response.usage.completion_tokens or 0

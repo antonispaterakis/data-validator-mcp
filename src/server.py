@@ -26,7 +26,7 @@ mcp = FastMCP(
     "data-validator-mcp",
     instructions=(
         "Training data label quality validator — detects mislabeled rows in a CSV "
-        "using KNN agreement scoring + a local LLM judge (LM Studio). No API key needed.\n\n"
+        "using KNN agreement scoring + a local LLM judge (Ollama). No API key needed.\n\n"
         "Step 1 — Call validate_dataset with the path to your CSV, the name of the "
         "text column, and the name of the label column. Optionally tune k_neighbors "
         "and agreement_threshold.\n\n"
@@ -83,9 +83,9 @@ def validate_dataset(
     llm_model: Annotated[
         str,
         Field(
-            description="LM Studio model name to use for judging. Must match the model loaded in LM Studio.",
+            description="Ollama model name to use for judging. Must be pulled and available in Ollama (e.g. `ollama pull llama3.1:8b`).",
         ),
-    ] = "meta-llama-3.1-8b-instruct",
+    ] = "llama3.1:8b",
 ) -> dict:
     """
     Run the full KNN validation pipeline on a CSV file and return a summary report.

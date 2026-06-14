@@ -55,7 +55,7 @@ class ValidationPipeline:
         embedding_model: str = "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract",
         k_neighbors: int = 5,
         agreement_threshold: float = 0.5,
-        llm_model: str = "meta-llama-3.1-8b-instruct",
+        llm_model: str = "llama3.1:8b",
     ):
         self.embedding_model = embedding_model
         self.k_neighbors = k_neighbors
