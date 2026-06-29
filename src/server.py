@@ -90,15 +90,17 @@ def validate_dataset(
         bool,
         Field(
             description=(
-                "Weight each neighbour's vote by its cosine similarity instead of "
-                "counting all K neighbours equally. Benchmarked against the original "
-                "unweighted majority vote on a ground-truth-labelled dataset "
-                "(see scripts/evaluate_neighbor_algorithms.py) and won on F1 and "
-                "precision at every K tested. Set False to restore the original "
-                "unweighted KNN behaviour."
-            ),
+                "If true, neighbours' votes are weighted by their cosine similarity to the target row. "
+                "If false, uses a simple majority vote (all k neighbours count equally)."
+            )
         ),
     ] = True,
+    mock_llm: Annotated[
+        bool,
+        Field(
+            description="If true, bypasses actual LLM inference and instantly assumes all flagged rows are bad."
+        ),
+    ] = False,
 ) -> dict:
     """
     Run the full KNN validation pipeline on a CSV file and return a summary report.
@@ -121,6 +123,7 @@ def validate_dataset(
             agreement_threshold=agreement_threshold,
             llm_model=llm_model,
             weighted_agreement=weighted_agreement,
+            mock_llm=mock_llm,
         )
         summary = _pipeline.run(csv_path, text_col, label_col)
         _ran = True

@@ -65,6 +65,7 @@ def main():
         k_neighbors=5,
         agreement_threshold=0.75,
         llm_model="meta-llama-3.1-8b-instruct",
+        mock_llm=True,
     )
 
     summary = pipeline.run(csv_path, text_col="text", label_col="label")

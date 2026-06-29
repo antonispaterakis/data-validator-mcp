@@ -57,6 +57,7 @@ class ValidationPipeline:
         agreement_threshold: float = 0.75,
         llm_model: str = "llama3.1:8b",
         weighted_agreement: bool = True,
+        mock_llm: bool = False,
     ):
         self.embedding_model = embedding_model
         self.k_neighbors = k_neighbors
@@ -69,6 +70,7 @@ class ValidationPipeline:
         # precision 0.610 vs 0.450, at comparable recall). Kept switchable in
         # case a future dataset behaves differently.
         self.weighted_agreement = weighted_agreement
+        self.mock_llm = mock_llm
 
         # Populated by run()
         self.df: Optional[pd.DataFrame] = None
@@ -300,16 +302,24 @@ class ValidationPipeline:
                 file=sys.stderr,
             )
 
-            judgement = judge.judge_knn_row(
-                text=texts[idx],
-                label=row_label,
-                anchor_text=anchor_text,
-                neighbor_contexts=neighbors,
-                agreement=stats["neighbor_agreement"],
-                n_matching=stats["n_matching_neighbors"],
-                k=stats["k"],
-                all_labels=all_labels,
-            )
+            if self.mock_llm:
+                judgement = {
+                    "verdict": "bad",
+                    "confidence": "high",
+                    "reasoning": "Mock mode enabled. Assuming row is bad based on KNN flag.",
+                    "suggested_label": "mock_label"
+                }
+            else:
+                judgement = judge.judge_knn_row(
+                    text=texts[idx],
+                    label=row_label,
+                    anchor_text=anchor_text,
+                    neighbor_contexts=neighbors,
+                    agreement=stats["neighbor_agreement"],
+                    n_matching=stats["n_matching_neighbors"],
+                    k=stats["k"],
+                    all_labels=all_labels,
+                )
 
             verdict = judgement["verdict"]
             confidence = judgement["confidence"]
