@@ -99,15 +99,15 @@ No API key needed — the server uses a local Ollama instance. Make sure Ollama 
 
 ## MCP Tools
 
-### `validate_dataset(csv_path, text_col, label_col, k_neighbors=5, agreement_threshold=0.5, llm_model="llama3.1:8b")`
+### `validate_dataset(csv_path, text_col, label_col, k_neighbors=15, agreement_threshold=0.75, llm_model="llama3.1:8b")`
 
 Runs the full pipeline and returns a JSON summary report.
 
 ```json
 {
   "total_rows": 60,
-  "k_neighbors": 5,
-  "agreement_threshold": 0.5,
+  "k_neighbors": 15,
+  "agreement_threshold": 0.75,
   "n_suspicious": 32,
   "n_confirmed_bad": 32,
   "llm_bad": 32,
@@ -137,7 +137,7 @@ Returns every row the LLM confirmed as potentially mislabeled. Must call `valida
     "needs_review": false,
     "neighbor_agreement": 0.2,
     "n_matching_neighbors": 1,
-    "k_neighbors": 5,
+    "k_neighbors": 15,
     "llm_verdict": "bad",
     "llm_confidence": "high",
     "llm_reasoning": "This text is clearly about a football match and belongs to sports, not technology.",
@@ -160,8 +160,8 @@ Returns KNN agreement statistics for every row flagged as suspicious *before* th
     "assigned_label": "technology",
     "neighbor_agreement": 0.2,
     "n_matching_neighbors": 1,
-    "k": 5,
-    "neighbor_label_counts": {"sports": 4, "technology": 1}
+    "k": 15,
+    "neighbor_label_counts": {"sports": 12, "technology": 3}
   }
 ]
 ```
@@ -189,7 +189,7 @@ Tests cover: embedding shape/dtype/normalization, cluster dominant-label logic, 
 
 Approximately **20 rows are intentionally mislabeled** (rows 41–60) — e.g. a sports headline labeled `technology`, a medical headline labeled `sports` — to demonstrate the validator's detection capability.
 
-**Verified run** (default settings — `k_neighbors=5`, `agreement_threshold=0.5`, `llm_model=llama3.1:8b`): 32/60 rows flagged as suspicious by KNN, all 32 confirmed `bad` by the LLM judge (`estimated_mislabel_pct: 53.3`). That's higher than the ~20 rows documented as intentionally mislabeled — at this threshold the KNN step also catches genuinely ambiguous boundary-case rows that the LLM agrees are mislabeled. Lowering `agreement_threshold` trades recall for precision if a tighter match to the known-bad rows is needed.
+**Verified run** (default settings — `k_neighbors=15`, `agreement_threshold=0.75`, `llm_model=llama3.1:8b`): 32/60 rows flagged as suspicious by KNN, all 32 confirmed `bad` by the LLM judge (`estimated_mislabel_pct: 53.3`). That's higher than the ~20 rows documented as intentionally mislabeled — at this threshold the KNN step also catches genuinely ambiguous boundary-case rows that the LLM agrees are mislabeled. Lowering `agreement_threshold` trades recall for precision if a tighter match to the known-bad rows is needed.
 
 ---
 
@@ -199,8 +199,8 @@ Approximately **20 rows are intentionally mislabeled** (rows 41–60) — e.g. a
 
 | Parameter | Default | Description |
 |---|---|---|
-| `k_neighbors` | `5` | Number of nearest neighbours per row for agreement scoring |
-| `agreement_threshold` | `0.5` | Minimum fraction of neighbours that must share a row's label for it to be considered clean |
+| `k_neighbors` | `15` | Number of nearest neighbours per row for agreement scoring |
+| `agreement_threshold` | `0.75` | Minimum fraction of neighbours that must share a row's label for it to be considered clean |
 | `llm_model` | `llama3.1:8b` | Ollama model used for judging flagged rows |
 
 `ValidationPipeline`'s constructor also exposes `embedding_model` (default: `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract`, reflecting this project's clinical-data validation use case — swap for `all-MiniLM-L6-v2` for general-purpose text).

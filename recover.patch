@@ -1,0 +1,60 @@
+diff --git a/src/pipeline.py b/src/pipeline.py
+index 4b34385..2ddae10 100644
+--- a/src/pipeline.py
++++ b/src/pipeline.py
+@@ -53,14 +53,22 @@ class ValidationPipeline:
+     def __init__(
+         self,
+         embedding_model: str = "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract",
+-        k_neighbors: int = 5,
+-        agreement_threshold: float = 0.5,
++        k_neighbors: int = 15,
++        agreement_threshold: float = 0.75,
+         llm_model: str = "llama3.1:8b",
++        weighted_agreement: bool = True,
+     ):
+         self.embedding_model = embedding_model
+         self.k_neighbors = k_neighbors
+         self.agreement_threshold = agreement_threshold
+         self.llm_model = llm_model
++        # Distance-weighted KNN agreement vs the original unweighted majority
++        # vote. Benchmarked on data/large_dataset.csv (ground-truth labels)
++        # via scripts/evaluate_neighbor_algorithms.py: weighted agreement beat
++        # plain majority vote at every k tested (e.g. k=15: F1 0.704 vs 0.600,
++        # precision 0.610 vs 0.450, at comparable recall). Kept switchable in
++        # case a future dataset behaves differently.
++        self.weighted_agreement = weighted_agreement
+ 
+         # Populated by run()
+         self.df: Optional[pd.DataFrame] = None
+@@ -215,9 +223,27 @@ class ValidationPipeline:
+         for idx in range(N):
+             top_k = sorted_neighbors[idx, :k]
+             neighbor_labels = [labels.iloc[int(j)] for j in top_k]
+-
+-            n_matching = sum(1 for l in neighbor_labels if l == labels.iloc[idx])
+-            agreement = n_matching / k
++            same_label_mask = [l == labels.iloc[idx] for l in neighbor_labels]
++
++            n_matching = sum(same_label_mask)
++
++            if self.weighted_agreement:
++                # Weight each neighbour's vote by its cosine similarity
++                # instead of counting every one of the k neighbours equally.
++                # A same-label neighbour at sim=0.95 should outweigh several
++                # barely-similar same-label neighbours at sim=0.2, and a
++                # near-duplicate with a different label should be a stronger
++                # red flag than a loosely-similar one.
++                neighbor_sims = np.clip(sim_matrix[idx, top_k], 0, None)
++                denom = float(neighbor_sims.sum())
++                if denom > 1e-8:
++                    agreement = float(
++                        (neighbor_sims * np.array(same_label_mask)).sum() / denom
++                    )
++                else:
++                    agreement = n_matching / k  # fallback: all sims ~0
++            else:
++                agreement = n_matching / k
+ 
+             if agreement < self.agreement_threshold:
+                 suspicious_indices.append(idx)

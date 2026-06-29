@@ -151,3 +151,85 @@ class TestValidationPipeline:
         assert summary["n_suspicious"] == 0
         assert summary["llm_bad"] == 0
         assert summary["total_rows"] > 0
+
+
+class TestWeightedAgreement:
+    """
+    Distance-weighted KNN agreement (default since the
+    scripts/evaluate_neighbor_algorithms.py benchmark showed it beats plain
+    majority-vote KNN on F1/precision at every K tested). Covers both modes
+    and the case that motivated the change: a near-duplicate with a
+    different label should be a *stronger* signal than several
+    loosely-similar same-label neighbours.
+    """
+
+    def _mixed_similarity_embeddings(self) -> tuple[list[str], pd.Series, np.ndarray]:
+        # Row 0 ("target"): label A.
+        # Neighbours: one near-duplicate with label B (sim ~0.95), and three
+        # loosely-similar same-label-A neighbours (sim ~0.2).
+        # Plain majority vote (3 vs 1) says "agrees with its label" (0.75).
+        # Weighted-by-similarity should flag this as suspicious instead,
+        # since the one disagreeing neighbour dominates by similarity.
+        texts = ["target", "near-dup-diff-label", "loose-a1", "loose-a2", "loose-a3"]
+        labels = pd.Series(["A", "B", "A", "A", "A"])
+
+        # Build 2D embeddings by hand with known cosine similarities to row 0.
+        def vec(angle_deg: float) -> np.ndarray:
+            theta = np.radians(angle_deg)
+            return np.array([np.cos(theta), np.sin(theta)])
+
+        embeddings = np.array([
+            vec(0),      # target itself, angle 0
+            vec(18),     # near-duplicate, diff label -> cos(18°) ≈ 0.95
+            vec(78),     # loose same-label -> cos(78°) ≈ 0.21
+            vec(80),
+            vec(82),
+        ])
+        return texts, labels, embeddings
+
+    def test_weighted_flags_near_duplicate_conflict(self):
+        texts, labels, embeddings = self._mixed_similarity_embeddings()
+
+        weighted = ValidationPipeline(k_neighbors=4, agreement_threshold=0.5, weighted_agreement=True)
+        weighted.embeddings = embeddings
+        w_suspicious, w_stats, _ = weighted._compute_knn_flags(texts, labels)
+
+        plain = ValidationPipeline(k_neighbors=4, agreement_threshold=0.5, weighted_agreement=False)
+        plain.embeddings = embeddings
+        p_suspicious, p_stats, _ = plain._compute_knn_flags(texts, labels)
+
+        # Plain majority vote: 3/4 same-label neighbours -> agreement 0.75 -> NOT flagged.
+        assert 0 not in p_suspicious
+
+        # Weighted: the near-duplicate (sim ~0.95, different label) should
+        # dominate the three loosely-similar same-label neighbours (sim ~0.2
+        # each), pulling weighted agreement below the threshold.
+        assert 0 in w_suspicious
+        flagged_stat = next(s for s in w_stats if s["row_index"] == 0)
+        assert flagged_stat["neighbor_agreement"] < 0.5
+        p_stat_0 = next((s for s in p_stats if s["row_index"] == 0), None)
+        if p_stat_0:
+            assert flagged_stat["neighbor_agreement"] < p_stat_0["neighbor_agreement"]
+
+    def test_weighted_agreement_default_is_true(self):
+        assert ValidationPipeline().weighted_agreement is True
+
+    def test_weighted_and_unweighted_agree_when_all_neighbors_equidistant(self):
+        """When all neighbours are equally similar, weighting changes nothing."""
+        labels = pd.Series(["A", "A", "A", "B", "B"])
+        texts = [f"row{i}" for i in range(5)]
+        # All pairwise cosine similarities equal -> identical unit vectors
+        # except tiny perturbation to keep argsort stable/deterministic.
+        base = np.array([1.0, 0.0])
+        embeddings = np.tile(base, (5, 1)) + np.random.RandomState(0).normal(0, 1e-9, (5, 2))
+        embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+        weighted = ValidationPipeline(k_neighbors=4, agreement_threshold=0.5, weighted_agreement=True)
+        weighted.embeddings = embeddings
+        w_suspicious, _, _ = weighted._compute_knn_flags(texts, labels)
+
+        plain = ValidationPipeline(k_neighbors=4, agreement_threshold=0.5, weighted_agreement=False)
+        plain.embeddings = embeddings
+        p_suspicious, _, _ = plain._compute_knn_flags(texts, labels)
+
+        assert sorted(w_suspicious) == sorted(p_suspicious)

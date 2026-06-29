@@ -67,7 +67,7 @@ def validate_dataset(
                 "Default of 15 works well for datasets up to ~1000 rows."
             ),
         ),
-    ] = 5,
+    ] = 15,
     agreement_threshold: Annotated[
         float,
         Field(
@@ -86,6 +86,19 @@ def validate_dataset(
             description="Ollama model name to use for judging. Must be pulled and available in Ollama (e.g. `ollama pull llama3.1:8b`).",
         ),
     ] = "llama3.1:8b",
+    weighted_agreement: Annotated[
+        bool,
+        Field(
+            description=(
+                "Weight each neighbour's vote by its cosine similarity instead of "
+                "counting all K neighbours equally. Benchmarked against the original "
+                "unweighted majority vote on a ground-truth-labelled dataset "
+                "(see scripts/evaluate_neighbor_algorithms.py) and won on F1 and "
+                "precision at every K tested. Set False to restore the original "
+                "unweighted KNN behaviour."
+            ),
+        ),
+    ] = True,
 ) -> dict:
     """
     Run the full KNN validation pipeline on a CSV file and return a summary report.
@@ -107,6 +120,7 @@ def validate_dataset(
             k_neighbors=k_neighbors,
             agreement_threshold=agreement_threshold,
             llm_model=llm_model,
+            weighted_agreement=weighted_agreement,
         )
         summary = _pipeline.run(csv_path, text_col, label_col)
         _ran = True
