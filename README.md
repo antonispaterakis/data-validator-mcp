@@ -202,6 +202,8 @@ Approximately **20 rows are intentionally mislabeled** (rows 41–60) — e.g. a
 | `k_neighbors` | `15` | Number of nearest neighbours per row for agreement scoring |
 | `agreement_threshold` | `0.75` | Minimum fraction of neighbours that must share a row's label for it to be considered clean |
 | `llm_model` | `llama3.1:8b` | Ollama model used for judging flagged rows |
+| `weighted_agreement` | `True` | Weight each neighbour's vote by its cosine similarity (drastically improves precision over plain majority vote) |
+| `mock_llm` | `False` | Bypass actual LLM inference and instantly assume all flagged rows are bad (useful for testing) |
 
 `ValidationPipeline`'s constructor also exposes `embedding_model` (default: `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract`, reflecting this project's clinical-data validation use case — swap for `all-MiniLM-L6-v2` for general-purpose text).
 

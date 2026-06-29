@@ -50,6 +50,11 @@ as suspicious by KNN, all 32 confirmed "bad" by the LLM judge
 ✅ Re-ran the benchmark with the real `all-MiniLM-L6-v2` embeddings. The optimal threshold held true (0.767 at k=15). 
 ✅ `agreement_threshold` default has been bumped to `0.75` and `k_neighbors` to `15` across the pipeline and MCP server.
 
+## Testing & Visualizations (Resolved)
+
+✅ Added a `mock_llm` toggle to bypass the local Ollama judge (useful for rapid testing or GitHub demonstrations without the compute overhead).
+✅ Created a `plot_knn_concept.py` script that uses UMAP to project embeddings to 2D and visually demonstrates how the distance-weighted KNN algorithm outperforms plain KNN at calculating neighbors.
+
 ## Goal
 
 Present to Prof. Plagianakos as a training data quality tool for clinical AI use cases.
